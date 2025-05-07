@@ -17,14 +17,62 @@ app.use(morgan('dev'));
  * @returns {string[]} - Array of packed scripts found
  */
 function findEvalPackedJs(htmlContent) {
-    const pattern = /eval\(function\(p,a,c,k,e,d\)\{.*?\}\(.*?\)\)/gs;
-    const matches = htmlContent.match(pattern) || [];
+    // Extract script tags first to better isolate JavaScript content
+    const scriptTagPattern = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let scriptContent = '';
+    let match;
     
-    // Additional pattern to catch variations of packed scripts
-    const altPattern = /\(function\(.*?\)\{.*?\}\)\(.*?\)/gs;
-    const altMatches = htmlContent.match(altPattern) || [];
+    // Collect all script content
+    while ((match = scriptTagPattern.exec(htmlContent)) !== null) {
+        scriptContent += match[1] + '\n';
+    }
     
-    return [...matches, ...altMatches].filter(script => script.length > 100);
+    // If no script tags found, use the entire HTML content
+    if (!scriptContent) {
+        scriptContent = htmlContent;
+    }
+    
+    // More comprehensive patterns for eval-packed scripts
+    const patterns = [
+        // Standard eval packed pattern
+        /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*(?:d|r)\s*\)\s*\{[\s\S]*?\}\s*\([\s\S]*?\)\s*\)/g,
+        
+        // Alternative packer patterns
+        /\(function\s*\([\s\S]*?\)\s*\{[\s\S]*?\}\s*\([\s\S]*?\)\s*\)/g,
+        
+        // JJEncode pattern
+        /var\s+\w+\s*=~\[\]\s*;\s*\w+\s*=\{\}[\s\S]*?"\)\(\)/g,
+        
+        // Common obfuscation pattern
+        /var\s+_0x\w+\s*=\s*\["[^"]*"\][^;]*;/g
+    ];
+    
+    // Collect all matches from different patterns
+    const allMatches = [];
+    for (const pattern of patterns) {
+        const matches = [...scriptContent.matchAll(pattern)];
+        for (const m of matches) {
+            // Only add substantial scripts (avoid false positives)
+            if (m[0].length > 100) {
+                allMatches.push(m[0]);
+            }
+        }
+    }
+    
+    // If standard methods fail, use a more aggressive approach to find large code blocks
+    if (allMatches.length === 0) {
+        // Look for potential large JavaScript blocks
+        const largeJsBlockPattern = /(var\s+\w+\s*=[\s\S]{100,}?;)|(function\s*\(\)[\s\S]{100,}?\})/g;
+        const largeMatches = [...scriptContent.matchAll(largeJsBlockPattern)];
+        
+        for (const m of largeMatches) {
+            if (m[0] && m[0].length > 200) { // Only substantial blocks
+                allMatches.push(m[0]);
+            }
+        }
+    }
+    
+    return allMatches;
 }
 
 /**
@@ -54,7 +102,10 @@ function unpackPackedScript(packedJs) {
                 Math: Math,
                 Date: Date,
                 JSON: JSON,
-                console: console,
+                console: { 
+                    log: function(){}, 
+                    error: function(){} 
+                },
                 setTimeout: setTimeout,
                 setInterval: setInterval,
                 clearTimeout: clearTimeout,
@@ -145,6 +196,8 @@ app.get('/packed/:slug', async (req, res) => {
         try {
             // Fetch HTML content with proper error handling
             const url = `https://zpjid.com/bkg/${slug}?ref=animedub.pro`;
+            console.log(`Fetching content from: ${url}`);
+            
             const response = await axios.get(url, {
                 timeout: 30000,
                 headers: {
@@ -155,16 +208,23 @@ app.get('/packed/:slug', async (req, res) => {
                 }
             });
             
+            console.log(`Response received, length: ${response.data.length}`);
+            
             // Find eval-packed JavaScript with improved regex
             const packedScripts = findEvalPackedJs(response.data);
+            console.log(`Found ${packedScripts.length} packed scripts`);
             
             if (!packedScripts || packedScripts.length === 0) {
+                // Save a sample of the HTML for debugging
+                const sampleHtml = response.data.substring(0, 2000) + "...";
+                
                 return res.status(404).json({
                     success: false,
                     error: "No eval-packed scripts found for this slug",
                     debug: {
                         responseLength: response.data.length,
-                        sample: response.data.substring(0, 500) + "..."
+                        sample: sampleHtml,
+                        scripts_found: response.data.match(/<script/g) ? response.data.match(/<script/g).length : 0
                     }
                 });
             }
@@ -246,7 +306,7 @@ app.get('/unpack/:slug', async (req, res) => {
         
         try {
             // First get the packed scripts
-            const packedResponse = await axios.get(`http://localhost:${PORT}/packed/${slug}`);
+            const packedResponse = await axios.get(`http://localhost:${PORT}/packed/${slug}${index !== undefined ? `?index=${index}` : ''}`);
             
             if (!packedResponse.data.success) {
                 return res.status(404).json({
@@ -257,7 +317,7 @@ app.get('/unpack/:slug', async (req, res) => {
             }
             
             const packedScripts = packedResponse.data.packed_scripts || 
-                                 [packedResponse.data.packed_js];
+                                 [{ content: packedResponse.data.packed_js }];
             
             // If index is specified, unpack that specific script
             if (index !== undefined) {
@@ -269,14 +329,15 @@ app.get('/unpack/:slug', async (req, res) => {
                     });
                 }
                 
-                if (scriptIndex < 0 || scriptIndex >= packedScripts.length) {
+                const scriptContent = packedResponse.data.packed_js;
+                
+                if (!scriptContent) {
                     return res.status(400).json({
                         success: false,
-                        error: `Invalid index: ${index}. Available range: 0-${packedScripts.length - 1}`
+                        error: `No script content found for index ${scriptIndex}`
                     });
                 }
                 
-                const scriptContent = packedScripts[scriptIndex].content || packedScripts[scriptIndex];
                 const unpackedJs = unpackPackedScript(scriptContent);
                 
                 if (!unpackedJs) {
@@ -299,7 +360,17 @@ app.get('/unpack/:slug', async (req, res) => {
             // Unpack all scripts if no index specified
             const results = [];
             for (let i = 0; i < packedScripts.length; i++) {
-                const scriptContent = packedScripts[i].content || packedScripts[i];
+                const scriptContent = packedScripts[i].content;
+                
+                if (!scriptContent) {
+                    results.push({
+                        script_index: i,
+                        error: "No script content found",
+                        status: "failed"
+                    });
+                    continue;
+                }
+                
                 const unpackedJs = unpackPackedScript(scriptContent);
                 
                 if (unpackedJs) {
@@ -345,6 +416,13 @@ app.get('/unpack/:slug', async (req, res) => {
             stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     }
+});
+
+/**
+ * Simple health check endpoint
+ */
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', version: '1.1.0' });
 });
 
 /**
