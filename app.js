@@ -178,6 +178,49 @@ function extractSlugFromUrl(url) {
     }
 }
 
+// Fetch HTML content by slug
+async function fetchHtmlBySlug(slug) {
+    try {
+        const url = `https://zpjid.com/bkg/${slug}?ref=animedub.pro`;
+        console.log(`Fetching URL: ${url}`);
+        
+        const response = await axios.get(url, {
+            timeout: 30000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Referer': 'https://animedub.pro/'
+            }
+        });
+        
+        return response.data;
+    } catch (error) {
+        console.error(`Error fetching HTML: ${error.message}`);
+        
+        // Try with backup headers on timeout
+        if (error.code === 'ECONNABORTED') {
+            console.log('Request timed out, retrying with increased timeout');
+            try {
+                const response = await axios.get(`https://zpjid.com/bkg/${slug}?ref=animedub.pro`, {
+                    timeout: 60000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+                        'Accept': '*/*',
+                        'Accept-Language': 'en-US,en;q=0.9'
+                    }
+                });
+                return response.data;
+            } catch (retryError) {
+                console.error('Retry also failed:', retryError);
+                throw new Error(`Request timeout error: ${error.message}`);
+            }
+        }
+        
+        throw error;
+    }
+}
+
 // Main function to fetch page and extract m3u8 links
 async function getM3u8FromSource(url) {
     try {
@@ -368,7 +411,9 @@ app.get('/', (req, res) => {
         version: "1.0.0",
         endpoints: {
             "/scrape": "Scrape m3u8 links from a URL",
-            "/scrape/:slug": "Scrape m3u8 links using a video slug"
+            "/scrape/:slug": "Scrape m3u8 links using a video slug",
+            "/packed/:slug": "Get raw packed JavaScript from a slug",
+            "/unpack/:slug": "Get unpacked JavaScript from a slug"
         }
     });
 });
@@ -411,6 +456,179 @@ app.get('/scrape/:slug', async (req, res) => {
         res.json(result);
     } catch (error) {
         console.error(`Error in scrape_by_slug endpoint: ${error}`);
+        res.status(500).json({
+            success: false,
+            error: `Server error: ${error.message}`
+        });
+    }
+});
+
+// NEW ENDPOINT: Get packed JavaScript by slug
+app.get('/packed/:slug', async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const { index } = req.query;
+        
+        if (!slug) {
+            return res.status(400).json({
+                success: false,
+                error: "Slug parameter is required"
+            });
+        }
+        
+        try {
+            // Fetch HTML content
+            const htmlContent = await fetchHtmlBySlug(slug);
+            
+            // Find eval-packed JavaScript
+            const packedScripts = findEvalPackedJs(htmlContent);
+            
+            if (!packedScripts || packedScripts.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    error: "No eval-packed scripts found for this slug"
+                });
+            }
+            
+            // If index is specified, return that specific script
+            if (index !== undefined) {
+                const scriptIndex = parseInt(index, 10);
+                if (isNaN(scriptIndex) || scriptIndex < 0 || scriptIndex >= packedScripts.length) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `Invalid index: ${index}. Available range: 0-${packedScripts.length - 1}`
+                    });
+                }
+                
+                return res.json({
+                    success: true,
+                    slug,
+                    script_index: scriptIndex,
+                    total_scripts: packedScripts.length,
+                    packed_js: packedScripts[scriptIndex]
+                });
+            }
+            
+            // Return all packed scripts if no index specified
+            return res.json({
+                success: true,
+                slug,
+                total_scripts: packedScripts.length,
+                packed_scripts: packedScripts
+            });
+            
+        } catch (error) {
+            console.error(`Error fetching packed scripts: ${error.message}`);
+            return res.status(500).json({
+                success: false,
+                error: `Error fetching packed scripts: ${error.message}`
+            });
+        }
+    } catch (error) {
+        console.error(`Error in packed endpoint: ${error}`);
+        res.status(500).json({
+            success: false,
+            error: `Server error: ${error.message}`
+        });
+    }
+});
+
+// NEW ENDPOINT: Get unpacked JavaScript by slug
+app.get('/unpack/:slug', async (req, res) => {
+    try {
+        const { slug } = req.params;
+        const { index } = req.query;
+        
+        if (!slug) {
+            return res.status(400).json({
+                success: false,
+                error: "Slug parameter is required"
+            });
+        }
+        
+        try {
+            // Fetch HTML content
+            const htmlContent = await fetchHtmlBySlug(slug);
+            
+            // Find eval-packed JavaScript
+            const packedScripts = findEvalPackedJs(htmlContent);
+            
+            if (!packedScripts || packedScripts.length === 0) {
+                return res.status(404).json({
+                    success: false,
+                    error: "No eval-packed scripts found for this slug"
+                });
+            }
+            
+            // If index is specified, unpack that specific script
+            if (index !== undefined) {
+                const scriptIndex = parseInt(index, 10);
+                if (isNaN(scriptIndex) || scriptIndex < 0 || scriptIndex >= packedScripts.length) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `Invalid index: ${index}. Available range: 0-${packedScripts.length - 1}`
+                    });
+                }
+                
+                const unpackedJs = unpack(packedScripts[scriptIndex]);
+                
+                if (!unpackedJs) {
+                    return res.status(500).json({
+                        success: false,
+                        error: `Failed to unpack script at index ${scriptIndex}`
+                    });
+                }
+                
+                // Extract m3u8 links from the unpacked script
+                const m3u8Links = extractM3u8Links(unpackedJs);
+                
+                return res.json({
+                    success: true,
+                    slug,
+                    script_index: scriptIndex,
+                    total_scripts: packedScripts.length,
+                    unpacked_js: unpackedJs,
+                    m3u8_links: m3u8Links,
+                    m3u8_count: m3u8Links.length
+                });
+            }
+            
+            // Unpack all scripts if no index specified
+            const results = [];
+            for (let i = 0; i < packedScripts.length; i++) {
+                const unpackedJs = unpack(packedScripts[i]);
+                if (unpackedJs) {
+                    const m3u8Links = extractM3u8Links(unpackedJs);
+                    results.push({
+                        script_index: i,
+                        unpacked_js: unpackedJs,
+                        m3u8_links: m3u8Links,
+                        m3u8_count: m3u8Links.length
+                    });
+                } else {
+                    results.push({
+                        script_index: i,
+                        error: "Failed to unpack script"
+                    });
+                }
+            }
+            
+            return res.json({
+                success: true,
+                slug,
+                total_scripts: packedScripts.length,
+                results
+            });
+            
+        } catch (error) {
+            console.error(`Error unpacking scripts: ${error.message}`);
+            return res.status(500).json({
+                success: false,
+                error: `Error unpacking scripts: ${error.message}`
+            });
+        }
+    } catch (error) {
+        console.error(`Error in unpack endpoint: ${error}`);
         res.status(500).json({
             success: false,
             error: `Server error: ${error.message}`
