@@ -12,29 +12,32 @@ app.use(express.json());
 app.use(morgan('dev'));
 
 /**
- * Find eval-packed JavaScript in HTML content
- * @param {string} htmlContent - HTML content to search for packed scripts
- * @returns {string[]} - Array of packed scripts found
+ * Extracts all JavaScript content from HTML, including packed scripts
+ * @param {string} htmlContent - HTML content to search
+ * @returns {object} - Object containing extracted scripts data
  */
-function findEvalPackedJs(htmlContent) {
-    // Extract script tags first to better isolate JavaScript content
+function extractJavaScript(htmlContent) {
+    // Extract all script tags first
     const scriptTagPattern = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-    let scriptContent = '';
+    const scriptContents = [];
     let match;
     
-    // Collect all script content
+    // Collect all script contents
     while ((match = scriptTagPattern.exec(htmlContent)) !== null) {
-        scriptContent += match[1] + '\n';
+        if (match[1] && match[1].trim().length > 0) {
+            scriptContents.push(match[1]);
+        }
     }
     
-    // If no script tags found, use the entire HTML content
-    if (!scriptContent) {
-        scriptContent = htmlContent;
-    }
+    // Process the raw HTML as well (in case scripts are not in script tags)
+    const rawContent = htmlContent;
     
-    // More comprehensive patterns for eval-packed scripts
-    const patterns = [
-        // Standard eval packed pattern
+    // Find packed scripts using multiple detection techniques
+    const packedScripts = [];
+    
+    // Patterns for different types of packed/obfuscated JS
+    const packingPatterns = [
+        // Standard eval packed pattern (packer)
         /eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*(?:d|r)\s*\)\s*\{[\s\S]*?\}\s*\([\s\S]*?\)\s*\)/g,
         
         // Alternative packer patterns
@@ -43,36 +46,95 @@ function findEvalPackedJs(htmlContent) {
         // JJEncode pattern
         /var\s+\w+\s*=~\[\]\s*;\s*\w+\s*=\{\}[\s\S]*?"\)\(\)/g,
         
-        // Common obfuscation pattern
-        /var\s+_0x\w+\s*=\s*\["[^"]*"\][^;]*;/g
+        // Common obfuscation pattern with hexadecimal strings
+        /var\s+(_0x\w+|[a-zA-Z0-9_$]+)\s*=\s*\[(?:"|')[^\]]*(?:"|')\][^;]*;/g,
+        
+        // Function-based obfuscation
+        /function\s+[a-zA-Z0-9_$]+\s*\([^)]*\)\s*\{\s*(?:var|let|const)\s+[^;]*=[^;]*;[\s\S]{100,}?return[^}]*\}/g
     ];
     
-    // Collect all matches from different patterns
-    const allMatches = [];
-    for (const pattern of patterns) {
-        const matches = [...scriptContent.matchAll(pattern)];
-        for (const m of matches) {
-            // Only add substantial scripts (avoid false positives)
-            if (m[0].length > 100) {
-                allMatches.push(m[0]);
+    // Search in each script content first
+    for (const scriptContent of scriptContents) {
+        for (const pattern of packingPatterns) {
+            pattern.lastIndex = 0; // Reset regex state
+            while ((match = pattern.exec(scriptContent)) !== null) {
+                if (match[0] && match[0].length > 100) { // Only include substantial scripts
+                    packedScripts.push({
+                        source: 'script_tag',
+                        content: match[0],
+                        length: match[0].length
+                    });
+                }
             }
         }
     }
     
-    // If standard methods fail, use a more aggressive approach to find large code blocks
-    if (allMatches.length === 0) {
+    // Search in raw HTML as well
+    for (const pattern of packingPatterns) {
+        pattern.lastIndex = 0; // Reset regex state
+        while ((match = pattern.exec(rawContent)) !== null) {
+            // Check if this match is already included from script tags
+            const isDuplicate = packedScripts.some(script => 
+                script.content === match[0] || 
+                script.content.includes(match[0]) || 
+                match[0].includes(script.content)
+            );
+            
+            if (!isDuplicate && match[0] && match[0].length > 100) {
+                packedScripts.push({
+                    source: 'raw_html',
+                    content: match[0],
+                    length: match[0].length
+                });
+            }
+        }
+    }
+    
+    // Additional pass for large chunks that might be missed
+    if (packedScripts.length === 0) {
         // Look for potential large JavaScript blocks
         const largeJsBlockPattern = /(var\s+\w+\s*=[\s\S]{100,}?;)|(function\s*\(\)[\s\S]{100,}?\})/g;
-        const largeMatches = [...scriptContent.matchAll(largeJsBlockPattern)];
         
-        for (const m of largeMatches) {
-            if (m[0] && m[0].length > 200) { // Only substantial blocks
-                allMatches.push(m[0]);
+        for (const scriptContent of scriptContents) {
+            largeJsBlockPattern.lastIndex = 0;
+            while ((match = largeJsBlockPattern.exec(scriptContent)) !== null) {
+                if (match[0] && match[0].length > 200) { // Only substantial blocks
+                    packedScripts.push({
+                        source: 'script_tag_large_block',
+                        content: match[0],
+                        length: match[0].length
+                    });
+                }
+            }
+        }
+        
+        largeJsBlockPattern.lastIndex = 0;
+        while ((match = largeJsBlockPattern.exec(rawContent)) !== null) {
+            if (match[0] && match[0].length > 200) { // Only substantial blocks
+                const isDuplicate = packedScripts.some(script => 
+                    script.content === match[0]
+                );
+                
+                if (!isDuplicate) {
+                    packedScripts.push({
+                        source: 'raw_html_large_block',
+                        content: match[0],
+                        length: match[0].length
+                    });
+                }
             }
         }
     }
     
-    return allMatches;
+    return {
+        scriptTagsCount: scriptContents.length,
+        packedScripts: packedScripts,
+        debug: {
+            htmlLength: htmlContent.length,
+            firstScriptSample: scriptContents.length > 0 ? 
+                scriptContents[0].substring(0, 100) + '...' : 'No scripts found'
+        }
+    };
 }
 
 /**
@@ -84,17 +146,21 @@ function unpackPackedScript(packedJs) {
     try {
         // Create a sandbox with comprehensive environment
         const vm = new VM({
-            timeout: 5000,
+            timeout: 8000, // Increased timeout for complex scripts
             sandbox: {
                 result: null,
                 window: {
                     document: {},
-                    navigator: {},
-                    location: {}
+                    navigator: { userAgent: 'Mozilla/5.0' },
+                    location: { href: 'https://example.com' }
                 },
-                document: {},
-                navigator: {},
-                location: {},
+                document: {
+                    createElement: () => ({}),
+                    getElementById: () => ({}),
+                    body: {}
+                },
+                navigator: { userAgent: 'Mozilla/5.0' },
+                location: { href: 'https://example.com' },
                 // Add common functions that might be referenced
                 String: String,
                 Array: Array,
@@ -106,14 +172,14 @@ function unpackPackedScript(packedJs) {
                     log: function(){}, 
                     error: function(){} 
                 },
-                setTimeout: setTimeout,
-                setInterval: setInterval,
-                clearTimeout: clearTimeout,
-                clearInterval: clearInterval
+                setTimeout: function(fn) { try { fn(); } catch(e) {} },
+                setInterval: function(fn) { try { fn(); } catch(e) {} },
+                clearTimeout: function() {},
+                clearInterval: function() {}
             }
         });
 
-        // Robust unpacker that handles different packing formats
+        // Enhanced unpacker handling different packing formats
         const unpacker = `
             function unpack(packed) {
                 var env = {
@@ -127,8 +193,16 @@ function unpackPackedScript(packedJs) {
                             result = "Error in eval: " + e.message;
                         }
                     },
-                    window: {},
-                    document: {},
+                    window: {
+                        document: {},
+                        navigator: { userAgent: 'Mozilla/5.0' },
+                        location: { href: 'https://example.com' }
+                    },
+                    document: {
+                        createElement: function() { return {}; },
+                        getElementById: function() { return {}; },
+                        body: {}
+                    },
                     console: {
                         log: function() {},
                         error: function() {}
@@ -144,13 +218,53 @@ function unpackPackedScript(packedJs) {
                     result = "Error in unpacking: " + e.message;
                 }
                 
-                if(typeof result === 'string' && result.includes('Error')) {
-                    // Try alternative unpacking method
+                // Try multiple approaches if first one fails
+                if(!result || (typeof result === 'string' && result.includes('Error'))) {
+                    // Direct eval approach
+                    try {
+                        var evalResult;
+                        var originalEval = eval;
+                        env.eval = function(code) {
+                            evalResult = code;
+                        };
+                        
+                        with(env) {
+                            originalEval(packed);
+                        }
+                        
+                        if (evalResult) {
+                            result = evalResult;
+                        }
+                    } catch(e) {
+                        // Continue to next approach
+                    }
+                }
+                
+                // Function constructor approach
+                if(!result || (typeof result === 'string' && result.includes('Error'))) {
                     try {
                         var fn = new Function('return ' + packed);
-                        result = fn().toString();
-                    } catch(e2) {
-                        result = "Alternative unpacking failed: " + e2.message;
+                        result = fn();
+                        if (typeof result === 'function') {
+                            result = result.toString();
+                        }
+                    } catch(e) {
+                        // Continue to next approach
+                    }
+                }
+                
+                // Try a direct approach with function invocation
+                if(!result || (typeof result === 'string' && result.includes('Error'))) {
+                    try {
+                        var directResult = eval(packed);
+                        if (directResult && typeof directResult !== 'undefined') {
+                            result = directResult;
+                            if (typeof result === 'function') {
+                                result = result.toString();
+                            }
+                        }
+                    } catch(e) {
+                        // Final fallback
                     }
                 }
                 
@@ -160,26 +274,84 @@ function unpackPackedScript(packedJs) {
         `;
 
         vm.run(unpacker);
-        return vm.sandbox.result;
-    } catch (error) {
-        console.error('Error in VM:', error);
         
-        // Fallback to simple regex unpacking if VM fails
-        try {
-            // This handles common packed patterns
-            const unpacked = packedJs.replace(/eval\(function\(p,a,c,k,e,d\)\{.*?\}\(.*?\)\)/, '')
-                                    .replace(/\\x([0-9a-fA-F]{2})/g, (match, hex) => 
-                                        String.fromCharCode(parseInt(hex, 16)));
-            return unpacked;
-        } catch (fallbackError) {
-            console.error('Fallback unpacking failed:', fallbackError);
-            return null;
+        // Check if we got a valid result
+        if (vm.sandbox.result && 
+            typeof vm.sandbox.result === 'string' &&
+            !vm.sandbox.result.includes('Error in')) {
+            return vm.sandbox.result;
         }
+        
+        // Basic decoder for common obfuscation patterns
+        if (packedJs.includes('eval(function(p,a,c,k,e,')) {
+            // Try an additional approach specifically for Dean Edwards packer
+            const deobfuscator = `
+                var result = "";
+                try {
+                    // Mock eval to capture output
+                    var originalEval = eval;
+                    var capturedOutput = null;
+                    
+                    // Replace eval
+                    eval = function(code) {
+                        capturedOutput = code;
+                        return code;
+                    };
+                    
+                    // Execute the packed code
+                    ${packedJs};
+                    
+                    // Restore eval
+                    eval = originalEval;
+                    
+                    result = capturedOutput;
+                } catch(e) {
+                    result = "Deobfuscation error: " + e.message;
+                }
+            `;
+            
+            const deobfVm = new VM({
+                timeout: 5000,
+                sandbox: {
+                    result: null,
+                    console: { log: function(){}, error: function(){} }
+                }
+            });
+            
+            try {
+                deobfVm.run(deobfuscator);
+                if (deobfVm.sandbox.result && 
+                    typeof deobfVm.sandbox.result === 'string' &&
+                    !deobfVm.sandbox.result.includes('error')) {
+                    return deobfVm.sandbox.result;
+                }
+            } catch (e) {
+                console.error('Deobfuscator error:', e);
+            }
+        }
+        
+        // If all VM approaches fail, try regex-based unpacking for common formats
+        const hexEscapePattern = /\\x([0-9a-fA-F]{2})/g;
+        const unescaped = packedJs.replace(hexEscapePattern, (match, hex) => 
+            String.fromCharCode(parseInt(hex, 16)));
+            
+        // If unescaping made a substantial change, return it
+        if (unescaped !== packedJs && 
+            (unescaped.includes('function(') || unescaped.includes('var '))) {
+            return unescaped;
+        }
+        
+        // If we can't unpack, return a processed version of the original
+        return packedJs;
+        
+    } catch (error) {
+        console.error('Error in unpacking:', error);
+        return null;
     }
 }
 
 /**
- * API endpoint to get full packed scripts
+ * API endpoint to get packed scripts
  */
 app.get('/packed/:slug', async (req, res) => {
     try {
@@ -210,21 +382,20 @@ app.get('/packed/:slug', async (req, res) => {
             
             console.log(`Response received, length: ${response.data.length}`);
             
-            // Find eval-packed JavaScript with improved regex
-            const packedScripts = findEvalPackedJs(response.data);
+            // Extract JavaScript using our enhanced method
+            const extracted = extractJavaScript(response.data);
+            const packedScripts = extracted.packedScripts;
+            
             console.log(`Found ${packedScripts.length} packed scripts`);
             
             if (!packedScripts || packedScripts.length === 0) {
-                // Save a sample of the HTML for debugging
-                const sampleHtml = response.data.substring(0, 2000) + "...";
-                
                 return res.status(404).json({
                     success: false,
-                    error: "No eval-packed scripts found for this slug",
+                    error: "No packed scripts found for this slug",
                     debug: {
                         responseLength: response.data.length,
-                        sample: sampleHtml,
-                        scripts_found: response.data.match(/<script/g) ? response.data.match(/<script/g).length : 0
+                        scriptTagsFound: extracted.scriptTagsCount,
+                        sample: response.data.substring(0, 1000) + "..."
                     }
                 });
             }
@@ -251,8 +422,9 @@ app.get('/packed/:slug', async (req, res) => {
                     slug,
                     script_index: scriptIndex,
                     total_scripts: packedScripts.length,
-                    packed_js: packedScripts[scriptIndex],
-                    script_length: packedScripts[scriptIndex].length
+                    packed_js: packedScripts[scriptIndex].content,
+                    script_length: packedScripts[scriptIndex].length,
+                    source: packedScripts[scriptIndex].source
                 });
             }
             
@@ -261,13 +433,16 @@ app.get('/packed/:slug', async (req, res) => {
                 success: true,
                 slug,
                 total_scripts: packedScripts.length,
-                packed_scripts: packedScripts.map(script => ({
-                    content: script,
-                    length: script.length
+                packed_scripts: packedScripts.map((script, index) => ({
+                    index,
+                    content: script.content,
+                    length: script.length,
+                    source: script.source
                 })),
                 debug: {
-                    first_script_sample: packedScripts[0].substring(0, 200) + "...",
-                    last_script_sample: packedScripts[packedScripts.length - 1].substring(0, 200) + "..."
+                    first_script_sample: packedScripts[0].content.substring(0, 200) + "...",
+                    last_script_sample: packedScripts[packedScripts.length - 1].content.substring(0, 200) + "...",
+                    script_tags_found: extracted.scriptTagsCount
                 }
             });
             
@@ -290,12 +465,11 @@ app.get('/packed/:slug', async (req, res) => {
 });
 
 /**
- * API endpoint to unpack packed scripts
+ * API endpoint to unpack individual packed script
  */
-app.get('/unpack/:slug', async (req, res) => {
+app.get('/unpack/:slug/:index?', async (req, res) => {
     try {
-        const { slug } = req.params;
-        const { index } = req.query;
+        const { slug, index } = req.params;
         
         if (!slug) {
             return res.status(400).json({
@@ -305,8 +479,14 @@ app.get('/unpack/:slug', async (req, res) => {
         }
         
         try {
-            // First get the packed scripts
-            const packedResponse = await axios.get(`http://localhost:${PORT}/packed/${slug}${index !== undefined ? `?index=${index}` : ''}`);
+            // First get the packed script(s)
+            let packedEndpoint = `http://localhost:${PORT}/packed/${slug}`;
+            if (index !== undefined) {
+                packedEndpoint += `?index=${index}`;
+            }
+            
+            console.log(`Requesting packed script from: ${packedEndpoint}`);
+            const packedResponse = await axios.get(packedEndpoint);
             
             if (!packedResponse.data.success) {
                 return res.status(404).json({
@@ -316,49 +496,43 @@ app.get('/unpack/:slug', async (req, res) => {
                 });
             }
             
-            const packedScripts = packedResponse.data.packed_scripts || 
-                                 [{ content: packedResponse.data.packed_js }];
-            
-            // If index is specified, unpack that specific script
+            // Handle case where specific index was requested
             if (index !== undefined) {
-                const scriptIndex = parseInt(index, 10);
-                if (isNaN(scriptIndex)) {
-                    return res.status(400).json({
-                        success: false,
-                        error: "Index must be a number"
-                    });
-                }
-                
                 const scriptContent = packedResponse.data.packed_js;
                 
                 if (!scriptContent) {
                     return res.status(400).json({
                         success: false,
-                        error: `No script content found for index ${scriptIndex}`
+                        error: `No script content found for index ${index}`
                     });
                 }
+                
+                console.log(`Unpacking script of length ${scriptContent.length}`);
                 
                 const unpackedJs = unpackPackedScript(scriptContent);
                 
                 if (!unpackedJs) {
                     return res.status(500).json({
                         success: false,
-                        error: `Failed to unpack script at index ${scriptIndex}`
+                        error: `Failed to unpack script at index ${index}`
                     });
                 }
                 
                 return res.json({
                     success: true,
                     slug,
-                    script_index: scriptIndex,
-                    total_scripts: packedScripts.length,
+                    script_index: parseInt(index, 10),
+                    total_scripts: packedResponse.data.total_scripts,
                     unpacked_js: unpackedJs,
-                    unpacked_length: unpackedJs.length
+                    unpacked_length: unpackedJs.length,
+                    source: packedResponse.data.source
                 });
             }
             
-            // Unpack all scripts if no index specified
+            // Unpack all scripts
+            const packedScripts = packedResponse.data.packed_scripts;
             const results = [];
+            
             for (let i = 0; i < packedScripts.length; i++) {
                 const scriptContent = packedScripts[i].content;
                 
@@ -371,6 +545,8 @@ app.get('/unpack/:slug', async (req, res) => {
                     continue;
                 }
                 
+                console.log(`Unpacking script ${i+1}/${packedScripts.length} of length ${scriptContent.length}`);
+                
                 const unpackedJs = unpackPackedScript(scriptContent);
                 
                 if (unpackedJs) {
@@ -378,12 +554,14 @@ app.get('/unpack/:slug', async (req, res) => {
                         script_index: i,
                         unpacked_js: unpackedJs,
                         unpacked_length: unpackedJs.length,
+                        source: packedScripts[i].source,
                         status: "success"
                     });
                 } else {
                     results.push({
                         script_index: i,
                         error: "Failed to unpack script",
+                        source: packedScripts[i].source,
                         status: "failed"
                     });
                 }
@@ -419,10 +597,51 @@ app.get('/unpack/:slug', async (req, res) => {
 });
 
 /**
+ * Alternative endpoint for direct script unpacking
+ */
+app.post('/unpack-raw', express.text({ limit: '10mb' }), async (req, res) => {
+    try {
+        const scriptContent = req.body;
+        
+        if (!scriptContent || scriptContent.length < 50) {
+            return res.status(400).json({
+                success: false,
+                error: "Valid script content is required (min 50 characters)"
+            });
+        }
+        
+        console.log(`Unpacking raw script of length ${scriptContent.length}`);
+        
+        const unpackedJs = unpackPackedScript(scriptContent);
+        
+        if (!unpackedJs) {
+            return res.status(500).json({
+                success: false,
+                error: "Failed to unpack script"
+            });
+        }
+        
+        return res.json({
+            success: true,
+            unpacked_js: unpackedJs,
+            unpacked_length: unpackedJs.length
+        });
+        
+    } catch (error) {
+        console.error(`Error in unpack-raw endpoint: ${error}`);
+        res.status(500).json({
+            success: false,
+            error: `Server error: ${error.message}`,
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+        });
+    }
+});
+
+/**
  * Simple health check endpoint
  */
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', version: '1.1.0' });
+    res.json({ status: 'ok', version: '1.2.0' });
 });
 
 /**
@@ -440,10 +659,12 @@ app.use((err, req, res, next) => {
 
 // Start the server
 app.listen(PORT, () => {
-    console.log(`M3U8 Extractor API running on port ${PORT}`);
-    console.log(`Try these endpoints:
-    - http://localhost:${PORT}/packed/9q4yh8ji5k4w
-    - http://localhost:${PORT}/unpack/9q4yh8ji5k4w`);
+    console.log(`JavaScript Extractor API running on port ${PORT}`);
+    console.log(`Example endpoints:
+    - Packed JS: http://localhost:${PORT}/packed/9q4yh8ji5k4w
+    - Unpacked JS: http://localhost:${PORT}/unpack/9q4yh8ji5k4w
+    - Specific script: http://localhost:${PORT}/unpack/9q4yh8ji5k4w/0
+    - Health check: http://localhost:${PORT}/health`);
 });
 
 module.exports = app;
